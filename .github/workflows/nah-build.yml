@@ -1,0 +1,515 @@
+# NAH Support custom client build.
+#
+# Adapted from the x64 windows-flutter job in flutter-build.yml (keep the
+# toolchain/env pins below in sync with it when rebasing on upstream).
+# Builds two flavours of the branded client:
+#   support     - customer download, incoming-only, session-code aware
+#   technician  - staff client, full UI, pinned to our server
+#
+# Repo configuration used (Settings -> Secrets and variables -> Actions):
+#   vars.NAH_RENDEZVOUS_SERVER hbbs/hbbr host to pin the client to
+#   vars.NAH_RS_PUB_KEY        hbbs public key (empty means "do not pin")
+#   vars.NAH_API_BASE          support portal API base URL for session
+#                              registration (empty disables registration)
+#
+# Code signing (Azure Trusted Signing / Apple Developer ID) is a DELIBERATE,
+# PROTECTED action:
+#   - Runs ONLY on a manual `workflow_dispatch` with input sign=true AND
+#     github.actor == nahosting. Never on push, never on pull_request; fork
+#     PRs and other collaborators cannot reach it.
+#   - The signing jobs run in the `release-signing` environment, which holds
+#     the Apple secrets. NOTE: environment "required reviewers" need GitHub
+#     Enterprise on private repos, so the enforced gate is the actor check
+#     above; if the repo ever moves to a plan that supports it, add required
+#     reviewers to the environment as a second gate.
+#   - Auth is OIDC (no stored secret): an Entra app with a federated credential
+#     scoped to  repo:NuttyAboutHosting/rustdesk:environment:release-signing
+#     holding the "Artifact Signing Certificate Profile Signer" role on the
+#     signing account. Config comes from (non-secret) variables:
+#       vars.AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
+#       vars.AZURE_SIGNING_ENDPOINT / AZURE_SIGNING_ACCOUNT / AZURE_SIGNING_PROFILE
+
+name: NAH build
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: "Sign artifacts (Azure Trusted Signing / Apple Developer ID; only honoured for the repo owner). Leave false for an unsigned build."
+        type: boolean
+        default: false
+  push:
+    branches: [nah/custom-client]
+
+env:
+  # Pins copied from upstream flutter-build.yml - keep in sync on rebase.
+  SCITER_RUST_VERSION: "1.75"
+  MAC_RUST_VERSION: "1.81" # 1.81 required for macos: https://github.com/yury/cidre needs 1.81
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VERSION: "1.4.9"
+  # NAH build-time configuration (read via option_env! in src/nah.rs).
+  # All values come from repository variables so no endpoint appears in the
+  # source tree. Empty values produce an unpinned dev build.
+  NAH_RENDEZVOUS_SERVER: "${{ vars.NAH_RENDEZVOUS_SERVER }}"
+  NAH_API_BASE: "${{ vars.NAH_API_BASE }}"
+  NAH_RS_PUB_KEY: "${{ vars.NAH_RS_PUB_KEY }}"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-topmostwindow:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  build-windows-x64:
+    name: windows-x64-${{ matrix.flavor }}
+    needs: [generate-bridge, build-topmostwindow]
+    runs-on: windows-2022
+    # Signing only when deliberately dispatched with sign=true by nahosting.
+    # When signing, the job enters the `release-signing` environment (see the
+    # gate note at the top of this file). On any other run this is empty =>
+    # no environment, no signing.
+    env:
+      DO_SIGN: ${{ github.event_name == 'workflow_dispatch' && inputs.sign && github.actor == 'nahosting' }}
+    environment: ${{ (github.event_name == 'workflow_dispatch' && inputs.sign && github.actor == 'nahosting') && 'release-signing' || '' }}
+    permissions:
+      id-token: write   # OIDC token for Azure login (signing runs only)
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [support, technician]
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      # https://github.com/flutter/flutter/issues/155685
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]] && git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022-nah-${{ matrix.flavor }}
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+        shell: bash
+
+      - name: Build NahSupport (${{ matrix.flavor }})
+        env:
+          NAH_FLAVOR: ${{ matrix.flavor }}
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+      - name: find Runner.res
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res");
+          if [ "$runner_res" == "" ]; then
+            echo "Runner.res: not found";
+          else
+            echo "Runner.res: $runner_res";
+            cp $runner_res ./libs/portable/Runner.res;
+          fi
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: "./rustdesk"
+
+      # OIDC login - no stored secret. Azure only issues a token when this job
+      # runs in the `release-signing` environment of THIS repo (the federated
+      # credential is scoped to it), so a fork / PR / unapproved run cannot auth.
+      - name: Azure login (OIDC)
+        if: env.DO_SIGN == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign inner binaries (Azure Trusted Signing)
+        if: env.DO_SIGN == 'true'
+        uses: azure/trusted-signing-action@v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files-folder: ./rustdesk
+          files-folder-filter: exe,dll
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Build self-extracted executable
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          popd
+          mkdir -p ./NahOutput
+          if [ "${{ matrix.flavor }}" == "support" ]; then
+            out_name="NahSupport.exe"
+          else
+            out_name="NahSupportTechnician.exe"
+          fi
+          mv ./target/release/rustdesk-portable-packer.exe "./NahOutput/${out_name}"
+
+      - name: Sign self-extractor (Azure Trusted Signing)
+        if: env.DO_SIGN == 'true'
+        uses: azure/trusted-signing-action@v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files-folder: ./NahOutput
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nahsupport-windows-x64-${{ matrix.flavor }}
+          path: ./NahOutput/*.exe
+
+  # macOS arm64 build. Adapted from the aarch64-apple-darwin macos-flutter job
+  # in upstream flutter-build.yml (keep pins in sync on rebase). Notes:
+  #   - The min-macOS 12.3 bump upstream seds in at build time is committed on
+  #     this branch (build.py / Podfile / Cargo.toml / pbxproj), arm64-only fork.
+  #   - No custom flutter engine on macOS: rustdesk/engine only ships a
+  #     windows-x64 build; upstream's macOS job uses the stock 3.24.5 engine.
+  #   - Apple signing mirrors the Windows model: ONLY on workflow_dispatch with
+  #     sign=true by nahosting, inside the `release-signing` environment (see
+  #     the gate note at the top of this file). Secrets consumed there:
+  #       APPLE_CERT_P12_BASE64 / APPLE_CERT_PASSWORD  Developer ID Application cert
+  #       APPLE_TEAM_ID                                 team id in the identity
+  #       APPLE_API_KEY_P8_BASE64 / APPLE_API_KEY_ID / APPLE_API_ISSUER_ID
+  #                                                     App Store Connect API key
+  #                                                     for notarytool
+  build-macos-arm64:
+    name: macos-arm64-${{ matrix.flavor }}
+    # Dispatch-only: macOS runners bill at a 10x minute multiplier, which
+    # drains the free Actions allowance in a couple of push builds. Local
+    # releases (nah-release-macos.sh) are the primary macOS path; this job is
+    # the on-demand fallback.
+    if: github.event_name == 'workflow_dispatch'
+    needs: [generate-bridge]
+    runs-on: macos-14
+    env:
+      DO_SIGN: ${{ github.event_name == 'workflow_dispatch' && inputs.sign && github.actor == 'nahosting' }}
+    environment: ${{ (github.event_name == 'workflow_dispatch' && inputs.sign && github.actor == 'nahosting') && 'release-signing' || '' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [support, technician]
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install build runtime
+        run: |
+          brew install llvm create-dmg
+          if command -v pkg-config &>/dev/null; then
+              echo "pkg-config is already installed"
+          else
+              brew install pkg-config
+          fi
+
+      - name: Install NASM
+        run: |
+          # NASM 2.16.x from the official release (x86_64; runners ship Rosetta).
+          # brew's NASM 3.x is incompatible with the aom/multimedia ports.
+          wget -q https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip -q nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Workaround for flutter issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          # https://github.com/flutter/flutter/issues/133533
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+          grep -n '_setFramesEnabledState(false);' ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: aarch64-apple-darwin
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: macos-14-nah-${{ matrix.flavor }}
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+        shell: bash
+
+      - name: Build NahSupport.app (${{ matrix.flavor }})
+        env:
+          NAH_FLAVOR: ${{ matrix.flavor }}
+        run: |
+          ./build.py --flutter --hwcodec --unix-file-copy-paste --screencapturekit
+
+      # Unsigned builds: Xcode ad-hoc signs the app WITH the hardened runtime
+      # flag, which turns on library validation - and that refuses the ad-hoc
+      # FlutterMacOS.framework (dyld: "different Team IDs"), so the app would
+      # not launch at all. Re-sign plain ad-hoc (no runtime flag) so the
+      # unsigned artifact is usable for testing. Also refreshes the bundle
+      # seal broken by copying `service` in after the Xcode build.
+      - name: Ad-hoc re-sign app (unsigned builds)
+        if: env.DO_SIGN != 'true'
+        run: |
+          codesign --force --deep --sign - \
+            flutter/build/macos/Build/Products/Release/NAHSupport.app
+
+      # ---- Signing (workflow_dispatch + sign=true only) ----
+
+      - name: Import Developer ID certificate into a temp keychain
+        if: env.DO_SIGN == 'true'
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/nah-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Tolerate wrapped/whitespaced base64 in the secret value.
+          printf '%s' "$APPLE_CERT_P12_BASE64" | tr -d ' \t\r\n' | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          # Non-secret diagnostics: size + ASN.1 header (a valid p12 starts 3082).
+          wc -c "$RUNNER_TEMP/cert.p12"
+          head -c 2 "$RUNNER_TEMP/cert.p12" | xxd -p
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Codesign NAHSupport.app
+        if: env.DO_SIGN == 'true'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          APP="flutter/build/macos/Build/Products/Release/NAHSupport.app"
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep "Developer ID Application" | grep "$APPLE_TEAM_ID" \
+            | head -1 | sed -E 's/.*"(.+)"$/\1/')"
+          echo "Signing as: $IDENTITY"
+          ENTITLEMENTS="flutter/macos/Runner/Release.entitlements"
+          # Inside-out: every nested Mach-O first (dylibs, frameworks), then the
+          # executables (entitlements only on those), then the bundle itself.
+          find "$APP/Contents" -type f \( -name "*.dylib" -o -perm +111 \) \
+            -not -path "*/Contents/MacOS/*" -print0 |
+            while IFS= read -r -d '' f; do
+              if file "$f" | grep -q "Mach-O"; then
+                codesign --force --options runtime --timestamp --sign "$IDENTITY" "$f"
+              fi
+            done
+          find "$APP/Contents/Frameworks" -maxdepth 1 -name "*.framework" -print0 |
+            while IFS= read -r -d '' fw; do
+              codesign --force --options runtime --timestamp --sign "$IDENTITY" "$fw"
+            done
+          # Executables: the service helper and the app binary get entitlements.
+          find "$APP/Contents/MacOS" -type f -print0 |
+            while IFS= read -r -d '' f; do
+              if file "$f" | grep -q "Mach-O"; then
+                codesign --force --options runtime --timestamp \
+                  --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$f"
+              fi
+            done
+          codesign --force --options runtime --timestamp \
+            --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Create dmg
+        shell: bash
+        run: |
+          # give create-dmg more attempts to unmount its temp image (flaky on runners)
+          CREATE_DMG="$(command -v create-dmg)"
+          CREATE_DMG="$(readlink -f "$CREATE_DMG")"
+          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
+          if [ "${{ matrix.flavor }}" == "support" ]; then
+            out_name="NahSupport.dmg"
+          else
+            out_name="NahSupportTechnician.dmg"
+          fi
+          echo "OUT_DMG=$out_name" >> "$GITHUB_ENV"
+          mkdir -p ./NahOutput
+          create-dmg --volname "NAHSupport" \
+            --window-pos 200 120 --window-size 800 400 --icon-size 100 \
+            --icon "NAHSupport.app" 200 190 --hide-extension "NAHSupport.app" \
+            --app-drop-link 600 185 \
+            "./NahOutput/$out_name" \
+            ./flutter/build/macos/Build/Products/Release/NAHSupport.app
+
+      - name: Sign, notarize and staple dmg
+        if: env.DO_SIGN == 'true'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep "Developer ID Application" | grep "$APPLE_TEAM_ID" \
+            | head -1 | sed -E 's/.*"(.+)"$/\1/')"
+          codesign --force --timestamp --sign "$IDENTITY" "./NahOutput/$OUT_DMG"
+          KEY_FILE="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY_ID.p8"
+          echo -n "$APPLE_API_KEY_P8_BASE64" | base64 --decode -o "$KEY_FILE"
+          xcrun notarytool submit "./NahOutput/$OUT_DMG" \
+            --key "$KEY_FILE" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+          rm -f "$KEY_FILE"
+          xcrun stapler staple "./NahOutput/$OUT_DMG"
+          # Gatekeeper verdict for the shipped artifact
+          spctl -a -vvv -t install "./NahOutput/$OUT_DMG"
+
+      - name: Delete signing keychain
+        if: always() && env.DO_SIGN == 'true'
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nahsupport-macos-arm64-${{ matrix.flavor }}
+          path: ./NahOutput/*.dmg
